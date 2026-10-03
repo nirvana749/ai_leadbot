@@ -1,0 +1,7 @@
+.env
+venv/
+bot.db
+bot.db-shm
+bot.db-wal
+logs/
+__pycache__/
