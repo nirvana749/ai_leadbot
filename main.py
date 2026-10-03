@@ -38,7 +38,7 @@ from aiogram.types import (
     BotCommandScopeChat,
 )
 
-from ai import ask_ai, ask_followup, extract_profile
+from ai import ask_ai, ask_followup, analyze_message
 from storage import (
     get_mode,
     set_mode,
@@ -54,12 +54,27 @@ from storage import (
     mark_confirm_asked,
     mark_confirmed,
     mark_declined,
-    reset_profile_fields,
+    set_profile_fields,
     get_stats,
     get_confirmed_leads,
 )
 
-YES_WORDS = ("да", "верно", "все верно", "всё верно", "ок", "окей", "подтверждаю", "точно", "верны", "ага")
+# Ответ на карточку, который целиком (а не подстрокой) совпадает с одним из этих вариантов,
+# считаем подтверждением без запроса к ИИ. Всё остальное разбирает ИИ (analyze_message)
+YES_EXACT = {
+    "да", "верно", "все верно", "да верно", "да все верно", "все так", "да все так",
+    "правильно", "все правильно", "да правильно", "ок", "окей", "подтверждаю", "ага", "точно",
+}
+
+# Сообщение целиком из одного такого слова/фразы — явная просьба позвать человека, без ИИ
+# (бот сам подсказывает клиенту написать «менеджер», и это должно работать даже при сбое ИИ).
+# Остальные случаи («позовите кого-нибудь живого», злость, вопросы о скидках) определяет ИИ
+MANAGER_EXACT = {
+    "менеджер", "оператор", "человек", "живой человек", "позовите менеджера", "позови менеджера",
+    "нужен менеджер", "хочу менеджера", "менеджера", "менеджера пожалуйста",
+}
+
+DEFAULT_INTEREST = "Пакет привлечения клиентов"
 
 DECLINE_WORDS = (
     "не хочу", "не интересно", "неинтересно", "не нужно", "не надо",
@@ -138,6 +153,23 @@ def find_phone(text: str) -> tuple[str | None, bool]:
     if len(_digits_only(raw)) not in (10, 11):
         return None, False
     return validate_phone(raw), True
+
+
+def _normalize(text: str) -> str:
+    return text.lower().replace("ё", "е")
+
+
+def _has_phrase(text: str, phrases) -> bool:
+    """Есть ли в тексте одна из фраз ЦЕЛЫМИ словами: «позже» не найдётся в «позжесть»,
+    а «думаю» — в «передумаю»."""
+    t = _normalize(text)
+    return any(re.search(rf"(?<!\w){re.escape(_normalize(p))}(?!\w)", t) for p in phrases)
+
+
+def _is_exact(text: str, variants: set[str]) -> bool:
+    """Всё сообщение целиком (без знаков препинания) совпадает с одним из вариантов."""
+    t = " ".join(re.sub(r"[^\w\s]", " ", _normalize(text)).split())
+    return t in variants
 
 
 bot = Bot(token=BOT_TOKEN)
@@ -262,20 +294,23 @@ async def _send_to_client(user_id: int, text: str) -> None:
         logging.exception("Не удалось отправить сообщение клиенту %s", user_id)
 
 
-def format_profile(user_id: int, profile: dict) -> str:
+def format_profile(user_id: int, profile: dict, reason: str | None = None) -> str:
     if profile.get("confirmed"):
         status = "✅ Подтверждено"
     elif profile.get("declined"):
         status = "❌ Отказался"
     else:
         status = "🤔 Думает"
-    return (
+    text = (
         f"📋 Заявка от клиента {user_id} ({_channel_label(user_id)})\n"
         f"Имя: {profile.get('name') or '—'}\n"
         f"Телефон: {profile.get('phone') or '—'}\n"
         f"Услуга: {profile.get('interest') or '—'}\n"
         f"Статус: {status}"
     )
+    if reason:
+        text += f"\nПричина: {reason}"
+    return text
 
 
 def _is_manager_chat(chat_id) -> bool:
@@ -313,11 +348,11 @@ def _payment_keyboard(user_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-async def notify_manager_profile(user_id: int, profile: dict) -> None:
+async def notify_manager_profile(user_id: int, profile: dict, reason: str | None = None) -> None:
     if MANAGER_CHAT_ID:
         await bot.send_message(
             MANAGER_CHAT_ID,
-            format_profile(user_id, profile),
+            format_profile(user_id, profile, reason),
             reply_markup=_card_keyboard(user_id),
         )
 
@@ -581,11 +616,59 @@ CONFIRM_PROMPT_TEMPLATE = (
     "Если всё верно — напишите «да»."
 )
 
-MANAGER_TRIGGERS = [
-    "менеджер", "оператор",
-    "живой человек", "реальный человек", "нужен человек",
-    "с человеком", "позови человека", "хочу человека",
-]
+CONFIRM_REMINDER = "И гляньте, пожалуйста, данные для заявки выше: если всё верно — напишите «да», если нет — просто поправьте."
+
+HANDOVER_TEXT = "Подключаю живого специалиста, минутку 🙌"
+
+TECH_ISSUE_TEXT = "Секунду, у меня техническая заминка — уже разбираюсь. Если срочно, напишите «менеджер» 🙏"
+
+PHONE_TYPO_TEXT = "Кажется, в номере опечатка — пришлите, пожалуйста, в формате +7 7XX XXX XX XX 🙏"
+
+
+def _confirm_card(profile: dict) -> str:
+    return CONFIRM_PROMPT_TEMPLATE.format(**profile)
+
+
+def _missing_fields_text(profile: dict) -> str:
+    """Быстрый путь: клиент готов заказать — просим одним сообщением только то, чего не хватает."""
+    missing = []
+    if not profile.get("name"):
+        missing.append("как вас зовут")
+    if not profile.get("phone"):
+        missing.append("номер телефона")
+    return (
+        f"Отлично, оформим заявку на «{profile.get('interest') or DEFAULT_INTEREST}» 🙌 "
+        f"Напишите, пожалуйста, {' и '.join(missing)}."
+    )
+
+
+async def _handover_to_manager(user_id: int, reason: str) -> list[str]:
+    set_mode(user_id, "manager")
+    _cancel_followup(user_id)
+    if MANAGER_CHAT_ID:
+        await bot.send_message(MANAGER_CHAT_ID, f"🙋 Клиенту {_channel_label(user_id)} {user_id} нужен менеджер.")
+        await notify_manager_profile(user_id, get_profile(user_id), reason=reason)
+    return [HANDOVER_TEXT]
+
+
+async def _confirm_lead(user_id: int) -> list[str]:
+    mark_confirmed(user_id)
+    _cancel_followup(user_id)
+    await notify_manager_profile(user_id, get_profile(user_id))
+    return ["Отлично, спасибо! Передал заявку менеджеру, он свяжется с вами в ближайшее время 🙌"]
+
+
+def _apply_corrections(user_id: int, phone: str | None, looked_like_phone: bool, corrections: dict) -> list[str]:
+    """Клиент поправил данные в карточке — обновляем только то, что он исправил, и показываем карточку снова."""
+    fields = {k: v for k, v in corrections.items() if v}
+    if phone:
+        fields["phone"] = phone
+    elif looked_like_phone:
+        return [PHONE_TYPO_TEXT]
+    if not fields:
+        return ["Подскажите, пожалуйста, что именно исправить — просто напишите правильные данные."]
+    set_profile_fields(user_id, fields)
+    return ["Исправил 👍\n\n" + _confirm_card(get_profile(user_id))]
 
 
 async def _process_message(user_id: int, text: str, *, channel: str) -> list[str]:
@@ -614,7 +697,15 @@ async def _process_message(user_id: int, text: str, *, channel: str) -> list[str
         return []
 
     add_message(user_id, "user", text)
+    replies = await _reply_to_client(user_id, text, channel=channel)
+    # Пишем в историю всё, что ушло клиенту (карточки, «подключаю специалиста» и т.д.), —
+    # иначе ИИ и менеджер в /history не видят, что бот уже показал карточку или попросил телефон
+    for reply in replies:
+        add_message(user_id, "assistant", reply)
+    return replies
 
+
+async def _reply_to_client(user_id: int, text: str, *, channel: str) -> list[str]:
     # Телефон ловим как есть, без ИИ — просто по паттерну цифр в сообщении,
     # но проверяем, что это похоже на настоящий номер, а не на цифры от тролля
     # Карточку менеджеру пока не шлём — только когда клиент подтвердит все данные разом
@@ -622,88 +713,135 @@ async def _process_message(user_id: int, text: str, *, channel: str) -> list[str
     if phone:
         update_profile(user_id, {"phone": phone})
     elif looked_like_phone and not get_profile(user_id).get("phone"):
-        return ["Кажется, в номере опечатка — пришлите, пожалуйста, в формате +7 7XX XXX XX XX 🙏"]
+        return [PHONE_TYPO_TEXT]
 
-    # Триггер на переключение к менеджеру
-    if any(w in text.lower() for w in MANAGER_TRIGGERS):
-        # Перед хендовером пытаемся вытащить всё, что клиент уже успел сказать
-        # в этом же сообщении (имя/услугу) — иначе карточка уйдёт пустой
-        extracted = await extract_profile(get_history(user_id))
-        update_profile(user_id, extracted)
+    # Сообщение целиком — «менеджер»: зовём человека сразу, без ИИ
+    if _is_exact(text, MANAGER_EXACT):
+        return await _handover_to_manager(user_id, "Клиент попросил менеджера")
 
-        set_mode(user_id, "manager")
-        if MANAGER_CHAT_ID:
-            await bot.send_message(MANAGER_CHAT_ID, f"🙋 Клиент {_channel_label(user_id)} {user_id} просит менеджера.")
-            await notify_manager_profile(user_id, get_profile(user_id))
-        return ["Подключаю живого специалиста, минутку 🙌"]
-
-    # Ждём ответа клиента на вопрос "всё верно?" — перепроверка данных перед отправкой заявки
     profile = get_profile(user_id)
-    if profile.get("confirm_asked") and not profile.get("confirmed"):
-        if any(w in text.lower() for w in YES_WORDS):
-            mark_confirmed(user_id)
-            await notify_manager_profile(user_id, get_profile(user_id))
-            return ["Отлично, спасибо! Передал заявку менеджеру, он свяжется с вами в ближайшее время 🙌"]
-        else:
-            reset_profile_fields(user_id)
-            return [
-                "Хорошо, давайте уточним заново — напишите, пожалуйста, одним сообщением: "
-                "как вас зовут, номер телефона и какая услуга интересует."
-            ]
+    awaiting_confirmation = profile.get("confirm_asked") and not profile.get("confirmed")
+
+    # Простое «да» на карточку подтверждаем без лишнего запроса к ИИ
+    if awaiting_confirmation and _is_exact(text, YES_EXACT):
+        return await _confirm_lead(user_id)
 
     # Если телефон только что стал последним недостающим полем — профиль уже полный.
     # Не гоняем его через обычный ответ ИИ (он не знает про подтверждение и может
     # преждевременно попрощаться, как будто заявка уже отправлена) — сразу спрашиваем "всё верно?"
-    profile = get_profile(user_id)
     if is_profile_complete(profile) and not profile.get("confirmed") and not profile.get("confirm_asked"):
         mark_confirm_asked(user_id)
-        return [CONFIRM_PROMPT_TEMPLATE.format(**profile)]
+        return [_confirm_card(profile)]
 
     history = get_history(user_id)
     if channel == "telegram":
         # "Печатает..." — чтобы клиент видел, что бот уже работает над ответом, а не завис
         await bot.send_chat_action(user_id, "typing")
+
+    # Ответ клиенту и разбор сообщения запускаем параллельно — так ответ не ждёт вдвое дольше.
+    # Сначала дожидаемся разбора: если он решит, что ответ ИИ не нужен (зовём человека,
+    # клиент подтвердил карточку, быстрый путь к заявке) — ответ просто отменяем.
+    # В ask_ai передаём уже известный профиль, чтобы бот не переспрашивал то, что клиент уже сказал.
+    reply_task = asyncio.create_task(ask_ai(history, profile))
+
+    async def get_reply() -> str | None:
+        try:
+            return await reply_task
+        except Exception:
+            # ИИ недоступен (сеть/квота/сбой) — вызывающий код даст клиенту понятную реакцию
+            logging.exception("Не удалось получить ответ ИИ для %s (%s)", user_id, channel)
+            return None
+
     try:
-        # Ответ клиенту и извлечение данных не зависят друг от друга — запускаем
-        # оба запроса к ИИ параллельно, а не по очереди, иначе ответ ждём вдвое дольше.
-        # В ask_ai передаём уже известный профиль, чтобы бот не переспрашивал то, что клиент
-        # уже сказал раньше (например, имя), даже если тема разговора успела смениться.
-        reply, extracted = await asyncio.gather(
-            ask_ai(history, get_profile(user_id)),
-            extract_profile(history),
-        )
+        analysis = await analyze_message(history, profile, awaiting_confirmation=awaiting_confirmation)
     except Exception:
-        # ИИ недоступен (сеть/квота/сбой) — не оставляем клиента без ответа вообще,
-        # даём понятную реакцию и запасной путь на живого человека
-        logging.exception("Не удалось получить ответ ИИ для %s (%s)", user_id, channel)
-        return ["Секунду, у меня техническая заминка — уже разбираюсь. Если срочно, напишите «менеджер» 🙏"]
+        # Разбор не удался — просто отвечаем как обычно, ничего не теряя из данных клиента
+        logging.exception("Не удалось разобрать сообщение %s (%s)", user_id, channel)
+        analysis = None
 
-    add_message(user_id, "assistant", reply)
-    replies = [reply]
+    if analysis is None:
+        if awaiting_confirmation and phone and phone != profile.get("phone"):
+            # ИИ недоступен, но клиент прислал на карточку новый номер — это точно исправление
+            reply_task.cancel()
+            return _apply_corrections(user_id, phone, looked_like_phone, {})
+        reply = await get_reply()
+        return [reply] if reply else [TECH_ISSUE_TEXT]
 
-    # Карточку менеджеру здесь не шлём — только копим профиль молча,
-    # заявка уйдёт одним сообщением после подтверждения клиентом (ниже)
-    update_profile(user_id, extracted)
+    update_profile(user_id, {"name": analysis["name"], "interest": analysis["interest"]})
+
+    if analysis["needs_human"]:
+        reply_task.cancel()
+        return await _handover_to_manager(user_id, analysis["human_reason"])
+
+    if awaiting_confirmation:
+        action = analysis["confirmation"]
+        if action == "confirm":
+            reply_task.cancel()
+            return await _confirm_lead(user_id)
+        if action == "correct":
+            reply_task.cancel()
+            return _apply_corrections(user_id, phone, looked_like_phone, analysis["corrections"])
+        reply = await get_reply()
+        if action == "decline":
+            # Данные не стираем: если клиент передумает обратно, достаточно будет сказать «да»
+            mark_declined(user_id)
+            return [reply] if reply else [TECH_ISSUE_TEXT]
+        # Клиент спросил о другом — отвечаем и напоминаем про карточку (если ИИ сам уже
+        # не попросил написать «да»), данные не трогаем
+        if not reply:
+            return [TECH_ISSUE_TEXT]
+        return [reply] if _has_phrase(reply, ["да"]) else [reply, CONFIRM_REMINDER]
+
+    ready = analysis["ready_to_order"]
+    profile = get_profile(user_id)
+    if not profile.get("confirmed") and not profile.get("interest") and (
+        ready or (profile.get("name") and profile.get("phone"))
+    ):
+        # Клиент готов заказать (или уже оставил контакты), но услугу не назвал — значит, пакет
+        update_profile(user_id, {"interest": DEFAULT_INTEREST})
+        profile = get_profile(user_id)
 
     # Как только собраны имя, телефон и услуга — переспрашиваем клиента, всё ли верно
-    profile = get_profile(user_id)
     if is_profile_complete(profile) and not profile.get("confirmed") and not profile.get("confirm_asked"):
         mark_confirm_asked(user_id)
-        replies.append(CONFIRM_PROMPT_TEMPLATE.format(**profile))
-        return replies
+        card = _confirm_card(profile)
+        if ready and not analysis["asks_question"]:
+            reply_task.cancel()
+            return ["Отлично, оформляю заявку 🙌\n\n" + card]
+        reply = await get_reply()
+        return ([reply] if reply else []) + [card]
+
+    # Быстрый путь: клиент готов заказать, а данных не хватает — не продаём дальше
+    # и не спрашиваем про бизнес, просим одним сообщением только недостающее
+    if ready and not profile.get("confirmed"):
+        ask = _missing_fields_text(profile)
+        if not analysis["asks_question"]:
+            reply_task.cancel()
+            return [ask]
+        reply = await get_reply()
+        if not reply:
+            return [ask]
+        # ИИ, отвечая на вопрос, мог сам уже попросить контакты — тогда не дублируем просьбу
+        already_asked = (not profile.get("phone") and _has_phrase(reply, ["телефон", "телефона", "номер"])) or (
+            profile.get("phone") and _has_phrase(reply, ["зовут", "имя"])
+        )
+        return [reply] if already_asked else [reply, ask]
+
+    reply = await get_reply()
+    if not reply:
+        return [TECH_ISSUE_TEXT]
 
     # Клиент явно взял паузу подумать — планируем одно мягкое напоминание через пару часов,
-    # если он сам не напишет раньше (тогда _cancel_followup выше его отменит; для Instagram
-    # проактивный дожим пока недоступен, см. _schedule_followup)
-    if any(w in text.lower() for w in STALLING_WORDS):
+    # если он сам не напишет раньше (тогда _cancel_followup выше его отменит)
+    if _has_phrase(text, STALLING_WORDS):
         _schedule_followup(user_id)
 
     # Явный отказ — помечаем статус для карточки/статистики, но не обрываем диалог:
     # ИИ сам мягко отработает возражение по своим правилам (см. системный промпт)
-    if any(w in text.lower() for w in DECLINE_WORDS):
+    if _has_phrase(text, DECLINE_WORDS):
         mark_declined(user_id)
 
-    return replies
+    return [reply]
 
 
 @dp.message(F.text)

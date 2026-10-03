@@ -100,6 +100,16 @@ def update_profile(user_id: int, new_data: dict) -> dict | None:
     return get_profile(user_id) if changed else None
 
 
+def set_profile_fields(user_id: int, new_data: dict) -> None:
+    """Клиент исправил данные в карточке — перезаписываем только названные поля, остальное не трогаем."""
+    _ensure_profile_row(user_id)
+    for field in ("name", "phone", "interest"):
+        value = new_data.get(field)
+        if value:
+            _conn.execute(f"UPDATE profiles SET {field} = ? WHERE user_id = ?", (value, user_id))
+    _conn.commit()
+
+
 def is_profile_complete(profile: dict) -> bool:
     return bool(profile.get("name") and profile.get("phone") and profile.get("interest"))
 
