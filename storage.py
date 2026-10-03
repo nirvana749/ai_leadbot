@@ -44,6 +44,12 @@ CREATE TABLE IF NOT EXISTS profiles (
     confirmed INTEGER NOT NULL DEFAULT 0,
     declined INTEGER NOT NULL DEFAULT 0
 );
+
+-- Временная пауза бота, когда владелец сам пишет клиенту: до paused_until (UTC) бот молчит
+CREATE TABLE IF NOT EXISTS pauses (
+    user_id INTEGER PRIMARY KEY,
+    paused_until TEXT NOT NULL
+);
 """)
 _conn.commit()
 
@@ -149,13 +155,35 @@ def reset_profile_fields(user_id: int) -> None:
 
 def get_mode(user_id: int) -> str:
     row = _conn.execute("SELECT mode FROM modes WHERE user_id = ?", (user_id,)).fetchone()
-    return row["mode"] if row else "ai"
+    mode = row["mode"] if row else "ai"
+    if mode == "manager":
+        # Если это была временная пауза и её срок вышел — бот снова отвечает сам
+        expired = _conn.execute(
+            "SELECT 1 FROM pauses WHERE user_id = ? AND paused_until <= datetime('now')", (user_id,)
+        ).fetchone()
+        if expired:
+            set_mode(user_id, "ai")
+            return "ai"
+    return mode
 
 
 def set_mode(user_id: int, mode: str) -> None:
+    """Постоянная смена режима (менеджер взял чат / вернул ИИ) — временная пауза при этом снимается."""
     _conn.execute(
         "INSERT INTO modes (user_id, mode) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET mode = ?",
         (user_id, mode, mode),
+    )
+    _conn.execute("DELETE FROM pauses WHERE user_id = ?", (user_id,))
+    _conn.commit()
+
+
+def pause_ai(user_id: int, hours: float) -> None:
+    """Владелец сам написал клиенту — бот молчит указанное число часов (каждое новое сообщение продлевает)."""
+    set_mode(user_id, "manager")
+    _conn.execute(
+        "INSERT INTO pauses (user_id, paused_until) VALUES (?, datetime('now', ?)) "
+        "ON CONFLICT(user_id) DO UPDATE SET paused_until = excluded.paused_until",
+        (user_id, f"+{int(hours * 3600)} seconds"),
     )
     _conn.commit()
 

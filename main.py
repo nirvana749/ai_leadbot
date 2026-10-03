@@ -55,6 +55,7 @@ from storage import (
     mark_confirmed,
     mark_declined,
     set_profile_fields,
+    pause_ai,
     get_stats,
     get_confirmed_leads,
 )
@@ -96,6 +97,9 @@ WEBHOOK_PORT = int(os.getenv("PORT") or os.getenv("WEBHOOK_PORT", "8000"))
 # подтверждение оплаты)
 MANYCHAT_API_KEY = os.getenv("MANYCHAT_API_KEY", "")
 MANYCHAT_API_URL = "https://api.manychat.com/fb/sending/sendContent"
+# Сколько часов бот молчит после того, как владелец сам написал клиенту через бота
+# (каждое новое сообщение владельца продлевает паузу; кнопка «Вернуть ИИ» снимает её раньше)
+MANAGER_PAUSE_HOURS = float(os.getenv("MANAGER_PAUSE_HOURS", "12"))
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -385,7 +389,7 @@ async def _send_history(chat_id, user_id: int) -> None:
         await bot.send_message(chat_id, f"Переписки с {user_id} не найдено.")
         return
 
-    speakers = {"user": "Клиент", "assistant": "Бот"}
+    speakers = {"user": "Клиент", "assistant": "Бот", "manager": "Вы"}
     lines = [f"[{m['ts']}] {speakers.get(m['role'], m['role'])}: {m['content']}" for m in history]
 
     header = f"💬 Переписка с {user_id}\n\n"
@@ -405,7 +409,7 @@ async def _takeover(user_id: int) -> None:
     handoff_note = (
         "Это клиент из Instagram — отвечай ему напрямую в Live Chat в ManyChat."
         if _is_instagram(user_id) else
-        "Отвечай в личку боту, он перешлёт клиенту (см. forward_to_client)."
+        "Чтобы написать клиенту, ответь (Reply) на его сообщение или карточку здесь — бот перешлёт."
     )
     await bot.send_message(MANAGER_CHAT_ID, f"Бот замолчал для {user_id}. {handoff_note}")
     await bot.send_message(MANAGER_CHAT_ID, format_profile(user_id, get_profile(user_id)))
@@ -542,6 +546,61 @@ async def cb_confirm_payment(callback: CallbackQuery):
     user_id = int(callback.data.split(":", 1)[1])
     await _confirm_payment(user_id)
     await callback.answer("Оплата подтверждена")
+
+
+# ---------- Владелец сам пишет клиенту ----------
+# Ответ (Reply) в чате менеджера на карточку или пересланное сообщение клиента бот отправляет
+# этому клиенту и сам встаёт на паузу для него на MANAGER_PAUSE_HOURS — чтобы не влезать
+# в разговор владельца. Каждое следующее сообщение владельца продлевает паузу.
+
+# id клиента в наших сообщениях менеджеру: «клиента 123», «[✈️ Telegram 123]», «Чек от 123».
+# Перед id не может стоять «+» или цифра — так не путаем с номером телефона в карточке
+CLIENT_ID_PATTERN = re.compile(r"(?<![\d+])(-?\d{5,})")
+
+
+def _client_id_from_reply(message: Message) -> int | None:
+    replied = message.reply_to_message
+    if not replied:
+        return None
+    match = CLIENT_ID_PATTERN.search(replied.text or replied.caption or "")
+    return int(match.group(1)) if match else None
+
+
+async def _is_manager_reply(message: Message) -> bool:
+    return _is_manager(message) and _client_id_from_reply(message) is not None
+
+
+@dp.message(_is_manager_reply)
+async def manager_reply_to_client(message: Message):
+    user_id = _client_id_from_reply(message)
+    text = message.text or message.caption or ""
+    if _is_instagram(user_id):
+        sent = bool(text) and await _manychat_send(user_id, [text])
+    else:
+        try:
+            await bot.copy_message(user_id, message.chat.id, message.message_id)
+            sent = True
+        except Exception:
+            logging.exception("Не удалось отправить сообщение владельца клиенту %s", user_id)
+            sent = False
+
+    # На паузу встаём в любом случае: владелец явно взялся за этот диалог
+    pause_ai(user_id, MANAGER_PAUSE_HOURS)
+    _cancel_followup(user_id)
+    if text:
+        add_message(user_id, "manager", text)
+
+    hours = f"{MANAGER_PAUSE_HOURS:g}"
+    if sent:
+        status = f"✅ Отправлено клиенту {user_id}. Бот молчит в этом диалоге {hours} ч."
+    elif _is_instagram(user_id):
+        status = (
+            f"⚠️ Клиенту {user_id} не отправилось (нужен MANYCHAT_API_KEY, текст, и клиент должен был "
+            f"писать за последние 24 ч) — ответьте в ManyChat Inbox. Бот всё равно молчит {hours} ч."
+        )
+    else:
+        status = f"⚠️ Клиенту {user_id} не отправилось (возможно, он заблокировал бота). Бот молчит {hours} ч."
+    await message.answer(status, reply_markup=_card_keyboard(user_id))
 
 
 # ---------- Клиентские сообщения ----------
