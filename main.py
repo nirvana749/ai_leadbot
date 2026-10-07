@@ -26,10 +26,13 @@ except OSError:
 from aiohttp import web
 import aiohttp
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     Message,
     CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
     BotCommand,
@@ -54,6 +57,9 @@ from storage import (
     set_username,
     get_username,
     find_user_by_username,
+    get_pause_minutes_left,
+    get_recent_chats,
+    get_last_messages,
     get_stats,
     get_confirmed_leads,
 )
@@ -372,7 +378,7 @@ def _is_manager(message: Message) -> bool:
 # уже отправленные раньше карточки не сломались.
 
 MANAGER_MENU = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="📊 Статистика")]],
+    keyboard=[[KeyboardButton(text="💬 Чаты"), KeyboardButton(text="📊 Статистика")]],
     resize_keyboard=True,
 )
 
@@ -484,6 +490,138 @@ async def btn_stats(message: Message):
     if not _is_manager(message):
         return
     await message.answer(_stats_text())
+
+
+# ---------- Панель «Чаты»: посмотреть диалог и включить/выключить в нём ИИ ----------
+# По умолчанию ИИ отвечает всем. Менеджер открывает «💬 Чаты» → выбирает клиента →
+# видит последние сообщения и кнопку «Выключить ИИ» / «Включить ИИ» для этого клиента.
+
+CHATS_LIMIT = 10
+# Время в базе — UTC; показываем по Казахстану (UTC+5), можно поменять переменной окружения
+TZ_OFFSET_HOURS = float(os.getenv("TZ_OFFSET_HOURS", "5"))
+
+
+def _local_time(ts: str) -> str:
+    from datetime import datetime, timedelta
+    try:
+        dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S") + timedelta(hours=TZ_OFFSET_HOURS)
+    except (TypeError, ValueError):
+        return ts or ""
+    return dt.strftime("%d.%m %H:%M")
+
+
+def _ai_status(user_id: int) -> tuple[bool, str]:
+    """(включён ли ИИ, описание статуса для панели)."""
+    if get_mode(user_id) != "manager":
+        return True, "🤖 ИИ включён — бот отвечает сам"
+    minutes = get_pause_minutes_left(user_id)
+    if minutes is not None:
+        left = f"{minutes // 60} ч {minutes % 60} мин" if minutes >= 60 else f"{minutes} мин"
+        return False, f"⏸ ИИ на паузе — включится сам через {left}"
+    return False, "⏸ ИИ выключен — бот молчит, пока не включите"
+
+
+def _chats_view() -> tuple[str, InlineKeyboardMarkup | None]:
+    chats = [c for c in get_recent_chats(CHATS_LIMIT + 1) if not _is_manager_chat(c["user_id"])][:CHATS_LIMIT]
+    if not chats:
+        return "Диалогов пока нет.", None
+    buttons = []
+    for c in chats:
+        ai_on, _ = _ai_status(c["user_id"])
+        icon = "📷" if _is_instagram(c["user_id"]) else "✈️"
+        label = f"{'🤖' if ai_on else '⏸'} {icon} {_client_short(c['user_id'])} · {_local_time(c['ts'])}"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"chat:{c['user_id']}")])
+    text = "💬 Последние диалоги\n🤖 — отвечает ИИ, ⏸ — ИИ выключен\n\nНажмите на клиента, чтобы открыть чат:"
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _chat_panel(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    ai_on, status = _ai_status(user_id)
+    speakers = {"user": "👤 Клиент", "assistant": "🤖 Бот", "manager": "🙋 Вы"}
+    lines = []
+    for m in get_last_messages(user_id, 10):
+        content = m["content"] if len(m["content"]) <= 300 else m["content"][:300] + "…"
+        lines.append(f"{speakers.get(m['role'], m['role'])} ({_local_time(m['ts'])}):\n{content}")
+    body = "\n\n".join(lines) or "Сообщений пока нет."
+    text = f"💬 {_channel_label(user_id)} — {_client_ref(user_id)}\n{status}\n\n{body}"
+    if len(text) > 3900:
+        text = text[:1000] + "\n…\n" + text[-2800:]
+    toggle = (
+        InlineKeyboardButton(text="⏸ Выключить ИИ", callback_data=f"aioff:{user_id}")
+        if ai_on else
+        InlineKeyboardButton(text="▶️ Включить ИИ", callback_data=f"aion:{user_id}")
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [toggle],
+        [
+            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"chat:{user_id}"),
+            InlineKeyboardButton(text="⬅️ К списку", callback_data="chats"),
+        ],
+    ])
+    return text, keyboard
+
+
+async def _edit_panel(callback: CallbackQuery, text: str, keyboard) -> None:
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    except TelegramBadRequest as exc:
+        # «message is not modified» при «Обновить» без изменений — это нормально
+        if "not modified" not in str(exc):
+            await bot.send_message(callback.message.chat.id, text, reply_markup=keyboard)
+
+
+@dp.message(F.text == "💬 Чаты")
+async def btn_chats(message: Message):
+    if not _is_manager(message):
+        return
+    text, keyboard = _chats_view()
+    await message.answer(text, reply_markup=keyboard)
+
+
+@dp.message(Command("chats"))
+async def cmd_chats(message: Message):
+    await btn_chats(message)
+
+
+@dp.callback_query(F.data == "chats")
+async def cb_chats(callback: CallbackQuery):
+    if not _is_manager_chat(callback.message.chat.id):
+        await callback.answer()
+        return
+    text, keyboard = _chats_view()
+    await _edit_panel(callback, text, keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("chat:"))
+async def cb_chat(callback: CallbackQuery):
+    if not _is_manager_chat(callback.message.chat.id):
+        await callback.answer()
+        return
+    user_id = int(callback.data.split(":", 1)[1])
+    text, keyboard = _chat_panel(user_id)
+    await _edit_panel(callback, text, keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("aioff:") | F.data.startswith("aion:"))
+async def cb_toggle_ai(callback: CallbackQuery):
+    if not _is_manager_chat(callback.message.chat.id):
+        await callback.answer()
+        return
+    action, raw_id = callback.data.split(":", 1)
+    user_id = int(raw_id)
+    if action == "aioff":
+        # Без таймера: бот молчит, пока менеджер сам не включит ИИ обратно. Клиенту ничего не пишем
+        set_mode(user_id, "manager")
+        _cancel_followup(user_id)
+        note = "ИИ выключен для этого клиента"
+    else:
+        set_mode(user_id, "ai")
+        note = "ИИ снова отвечает этому клиенту"
+    text, keyboard = _chat_panel(user_id)
+    await _edit_panel(callback, text, keyboard)
+    await callback.answer(note)
 
 
 @dp.message(Command("leads"))
@@ -613,8 +751,10 @@ async def cmd_start(message: Message):
     if _is_manager(message):
         await message.answer(
             "Привет! Это панель управления ботом.\n\n"
-            "Кнопка «📊 Статистика» всегда снизу. Когда клиент просит живого человека — "
-            "придёт уведомление; чтобы ответить ему, нажмите «Ответить» на это уведомление.",
+            "Снизу две кнопки: «💬 Чаты» — последние диалоги, в каждом можно посмотреть переписку "
+            "и выключить/включить ИИ; «📊 Статистика» — сводка по заявкам.\n\n"
+            "Когда клиент просит живого человека — придёт уведомление. Чтобы ответить клиенту, "
+            "нажмите «Ответить» на уведомление или на открытый чат.",
             reply_markup=MANAGER_MENU,
         )
         return
@@ -737,7 +877,10 @@ async def _process_message(user_id: int, text: str, *, channel: str) -> list[str
     mode = get_mode(user_id)
 
     if mode == "manager":
-        # В ручном режиме бот молчит, но пересылает менеджеру, если тот не в диалоге
+        # В ручном режиме бот молчит, но пересылает менеджеру, если тот не в диалоге.
+        # В историю сообщение тоже пишем — чтобы оно было видно в панели «Чаты»
+        # и чтобы ИИ после включения знал, о чём шла речь
+        add_message(user_id, "user", text)
         if MANAGER_CHAT_ID:
             await bot.send_message(MANAGER_CHAT_ID, f"[{_channel_label(user_id)} {_client_short(user_id)}] {text}")
         # Телефон продолжаем ловить и в ручном режиме, чтобы данные не терялись
@@ -1005,6 +1148,7 @@ async def handle_other(message: Message):
 # В меню — только статистика. Остальные команды (/leads, /history, /takeover, /release)
 # по-прежнему работают, если набрать их вручную
 MANAGER_COMMANDS = [
+    BotCommand(command="chats", description="Последние диалоги: посмотреть, выключить/включить ИИ"),
     BotCommand(command="stats", description="Статистика заявок"),
 ]
 

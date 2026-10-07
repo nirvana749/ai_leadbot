@@ -198,6 +198,34 @@ def set_mode(user_id: int, mode: str) -> None:
     _conn.commit()
 
 
+def get_pause_minutes_left(user_id: int) -> int | None:
+    """Сколько минут ещё длится временная пауза (None — паузы с таймером нет)."""
+    row = _conn.execute(
+        "SELECT (julianday(paused_until) - julianday('now')) * 1440 AS m FROM pauses WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    return max(int(row["m"]), 0) if row else None
+
+
+def get_recent_chats(limit: int = 10) -> list[dict]:
+    """Последние диалоги (по последнему сообщению), свежие сверху — для панели менеджера."""
+    rows = _conn.execute(
+        "SELECT m.user_id, m.role, m.content, m.ts FROM messages m "
+        "JOIN (SELECT user_id, MAX(id) AS mid FROM messages GROUP BY user_id) t ON m.id = t.mid "
+        "ORDER BY m.id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_last_messages(user_id: int, limit: int = 10) -> list[dict]:
+    rows = _conn.execute(
+        "SELECT role, content, ts FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, limit),
+    ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
 def pause_ai(user_id: int, hours: float) -> None:
     """Владелец сам написал клиенту — бот молчит указанное число часов (каждое новое сообщение продлевает)."""
     set_mode(user_id, "manager")
