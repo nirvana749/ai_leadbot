@@ -320,11 +320,37 @@ async def _manychat_send(subscriber_id: int, texts: list[str]) -> bool:
                 body = await resp.text()
                 if resp.status != 200 or '"success"' not in body:
                     logging.error("ManyChat sendContent %s: %s", resp.status, body[:500])
+                    await _alert_delivery_failed(subscriber_id, f"HTTP {resp.status}: {body[:400]}")
                     return False
         return True
-    except Exception:
+    except Exception as exc:
         logging.exception("Не удалось отправить сообщение в ManyChat для %s", subscriber_id)
+        await _alert_delivery_failed(subscriber_id, repr(exc)[:400])
         return False
+
+
+# Чтобы при постоянной ошибке не засыпать менеджера одинаковыми уведомлениями —
+# не чаще раза в 10 минут на одного клиента
+_DELIVERY_ALERT_INTERVAL = 10 * 60
+_last_delivery_alert: dict[int, float] = {}
+
+
+async def _alert_delivery_failed(user_id: int, details: str) -> None:
+    """Ответ бота не дошёл до клиента в Instagram — сообщаем менеджеру в Telegram с текстом ошибки
+    ManyChat, иначе со стороны это выглядит так, будто бот просто молчит."""
+    if not MANAGER_CHAT_ID:
+        return
+    now = time.monotonic()
+    if now - _last_delivery_alert.get(user_id, -_DELIVERY_ALERT_INTERVAL) < _DELIVERY_ALERT_INTERVAL:
+        return
+    _last_delivery_alert[user_id] = now
+    try:
+        await bot.send_message(
+            MANAGER_CHAT_ID,
+            f"⚠️ Ответ бота не доставлен в Instagram — {_client_ref(user_id)}\n\nОшибка ManyChat:\n{details}",
+        )
+    except Exception:
+        logging.exception("Не удалось отправить менеджеру уведомление об ошибке доставки")
 
 
 async def _send_to_client(user_id: int, text: str) -> None:
