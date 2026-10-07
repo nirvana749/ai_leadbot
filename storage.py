@@ -235,24 +235,6 @@ def get_full_history(user_id: int) -> list[dict]:
     return [{"role": r["role"], "content": r["content"], "ts": r["ts"]} for r in rows]
 
 
-def set_payment_pending(user_id: int) -> None:
-    _conn.execute(
-        "INSERT INTO payments (user_id, pending) VALUES (?, 1) ON CONFLICT(user_id) DO UPDATE SET pending = 1",
-        (user_id,),
-    )
-    _conn.commit()
-
-
-def is_payment_pending(user_id: int) -> bool:
-    row = _conn.execute("SELECT pending FROM payments WHERE user_id = ?", (user_id,)).fetchone()
-    return bool(row and row["pending"])
-
-
-def confirm_payment(user_id: int) -> None:
-    _conn.execute("UPDATE payments SET pending = 0 WHERE user_id = ?", (user_id,))
-    _conn.commit()
-
-
 def get_confirmed_leads() -> list[dict]:
     """Список подтверждённых заявок, свежие сверху — для владельца, чтобы обзвонить клиентов."""
     rows = _conn.execute(

@@ -30,8 +30,6 @@ from aiogram.filters import Command
 from aiogram.types import (
     Message,
     CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
     BotCommand,
@@ -45,9 +43,6 @@ from storage import (
     add_message,
     get_history,
     get_full_history,
-    set_payment_pending,
-    is_payment_pending,
-    confirm_payment,
     get_profile,
     update_profile,
     is_profile_complete,
@@ -87,7 +82,6 @@ DECLINE_WORDS = (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MANAGER_CHAT_ID = os.getenv("MANAGER_CHAT_ID")  # твой личный chat_id или id группы менеджеров
-KASPI_LINK = os.getenv("KASPI_LINK", os.getenv("KASPI_PHONE", "ссылка_на_оплату"))
 
 # ManyChat дёргает этот вебхук через блок "External Request" для Instagram-диалогов.
 # Токен нужен, чтобы эндпоинт не мог дёргать кто попало из интернета (он публичный)
@@ -96,8 +90,7 @@ MANYCHAT_WEBHOOK_TOKEN = os.getenv("MANYCHAT_WEBHOOK_TOKEN")
 WEBHOOK_PORT = int(os.getenv("PORT") or os.getenv("WEBHOOK_PORT", "8000"))
 # API-ключ ManyChat (Settings → API). Если задан — отвечаем в Instagram через ManyChat API,
 # а не в ответе на External Request. Это снимает таймаут ManyChat (~10 сек): ИИ может думать
-# сколько нужно, а ещё бот начинает сам писать Instagram-клиентам (дожим, «подключаю специалиста»,
-# подтверждение оплаты)
+# сколько нужно, а ещё бот начинает сам писать Instagram-клиентам (дожим, «подключаю специалиста»)
 MANYCHAT_API_KEY = os.getenv("MANYCHAT_API_KEY", "")
 MANYCHAT_API_URL = "https://api.manychat.com/fb/sending/sendContent"
 MANYCHAT_INFO_URL = "https://api.manychat.com/fb/subscriber/getInfo"
@@ -384,12 +377,6 @@ MANAGER_MENU = ReplyKeyboardMarkup(
 )
 
 
-def _payment_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Подтвердить оплату", callback_data=f"confirm_payment:{user_id}")]
-    ])
-
-
 async def notify_manager_profile(user_id: int, profile: dict, reason: str | None = None) -> None:
     if MANAGER_CHAT_ID:
         await bot.send_message(
@@ -458,13 +445,6 @@ async def _release(user_id: int) -> None:
     await bot.send_message(MANAGER_CHAT_ID, f"ИИ снова отвечает {_client_short(user_id)}.")
 
 
-async def _confirm_payment(user_id: int) -> None:
-    confirm_payment(user_id)
-    _cancel_followup(user_id)
-    await bot.send_message(MANAGER_CHAT_ID, f"Оплата {_client_short(user_id)} подтверждена.")
-    await _send_to_client(user_id, "Оплата подтверждена, спасибо! 🎉 Дальше расскажу, что происходит.")
-
-
 # ---------- Команды менеджера (на случай, если удобнее текстом) ----------
 
 @dp.message(Command("takeover"))
@@ -489,18 +469,6 @@ async def cmd_release(message: Message):
         await message.answer("Формат: /release <user_id>")
         return
     await _release(int(parts[1]))
-
-
-@dp.message(Command("confirm_payment"))
-async def cmd_confirm_payment(message: Message):
-    """Менеджер подтверждает оплату вручную: /confirm_payment 123456789"""
-    if not _is_manager(message):
-        return
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("Формат: /confirm_payment <user_id>")
-        return
-    await _confirm_payment(int(parts[1]))
 
 
 @dp.message(Command("stats"))
@@ -575,22 +543,12 @@ async def cb_history(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("confirm_payment:"))
-async def cb_confirm_payment(callback: CallbackQuery):
-    if not _is_manager_chat(callback.message.chat.id):
-        await callback.answer()
-        return
-    user_id = int(callback.data.split(":", 1)[1])
-    await _confirm_payment(user_id)
-    await callback.answer("Оплата подтверждена")
-
-
 # ---------- Владелец сам пишет клиенту ----------
 # Ответ (Reply) в чате менеджера на карточку или пересланное сообщение клиента бот отправляет
 # этому клиенту и сам встаёт на паузу для него на MANAGER_PAUSE_HOURS — чтобы не влезать
 # в разговор владельца. Каждое следующее сообщение владельца продлевает паузу.
 
-# id клиента в наших сообщениях менеджеру: «клиента 123», «[✈️ Telegram 123]», «Чек от 123».
+# id клиента в наших сообщениях менеджеру: «id 123», «[✈️ Telegram id 123]».
 # Перед id не может стоять «+» или цифра — так не путаем с номером телефона в карточке
 CLIENT_ID_PATTERN = re.compile(r"(?<![\d+])(-?\d{5,})")
 
@@ -666,36 +624,6 @@ async def cmd_start(message: Message):
         "он на связи 24/7 и ответит на любые вопросы. Если понадобится живой человек — просто напиши об этом.\n\n"
         "Чем я могу вам помочь?"
     )
-
-
-@dp.message(F.text.lower().in_({"оплатить", "оплата", "как оплатить"}))
-async def request_payment(message: Message):
-    user_id = message.from_user.id
-    set_payment_pending(user_id)
-    await message.answer(
-        f"Для оплаты перейди по ссылке:\n{KASPI_LINK}\n\n"
-        "После оплаты пришли сюда скриншот чека — менеджер подтвердит."
-    )
-
-
-@dp.message(F.photo)
-async def receive_payment_screenshot(message: Message):
-    user_id = message.from_user.id
-    _remember_tg_username(message)
-    try:
-        if is_payment_pending(user_id):
-            await message.answer("Скриншот получен, жду подтверждения от менеджера 🙏")
-            if MANAGER_CHAT_ID:
-                await bot.forward_message(MANAGER_CHAT_ID, message.chat.id, message.message_id)
-                await bot.send_message(
-                    MANAGER_CHAT_ID,
-                    f"Чек от {_client_short(user_id)}.",
-                    reply_markup=_payment_keyboard(user_id),
-                )
-        else:
-            await message.answer("Фото получил, но оплату не ждал — если это чек, напиши 'оплата'.")
-    except Exception:
-        await _reply_with_fallback(message, user_id)
 
 
 async def _reply_with_fallback(message: Message, user_id: int) -> None:
@@ -1069,13 +997,13 @@ async def handle_other(message: Message):
             await bot.forward_message(MANAGER_CHAT_ID, message.chat.id, message.message_id)
         return
     await message.answer(
-        "Пока понимаю только текстовые сообщения (и скриншот чека при оплате) — "
+        "Пока понимаю только текстовые сообщения — "
         "напишите, пожалуйста, словами 🙂"
     )
 
 
-# В меню — только статистика. Остальные команды (/leads, /history, /takeover, /release,
-# /confirm_payment) по-прежнему работают, если набрать их вручную
+# В меню — только статистика. Остальные команды (/leads, /history, /takeover, /release)
+# по-прежнему работают, если набрать их вручную
 MANAGER_COMMANDS = [
     BotCommand(command="stats", description="Статистика заявок"),
 ]
