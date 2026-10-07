@@ -55,11 +55,12 @@ _conn.commit()
 
 # Добавлено позже — на уже существующей базе ALTER TABLE может упасть, если колонка
 # уже есть, это ожидаемо и безопасно игнорировать
-try:
-    _conn.execute("ALTER TABLE profiles ADD COLUMN confirmed_at TEXT")
-    _conn.commit()
-except sqlite3.OperationalError:
-    pass
+for _column in ("confirmed_at TEXT", "username TEXT"):
+    try:
+        _conn.execute(f"ALTER TABLE profiles ADD COLUMN {_column}")
+        _conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
 
 def _empty_profile() -> dict:
@@ -114,6 +115,26 @@ def set_profile_fields(user_id: int, new_data: dict) -> None:
         if value:
             _conn.execute(f"UPDATE profiles SET {field} = ? WHERE user_id = ?", (value, user_id))
     _conn.commit()
+
+
+def set_username(user_id: int, username: str) -> None:
+    """Ник клиента в Telegram/Instagram (без @) — по нему менеджер может связаться с человеком."""
+    _ensure_profile_row(user_id)
+    _conn.execute("UPDATE profiles SET username = ? WHERE user_id = ?", (username, user_id))
+    _conn.commit()
+
+
+def get_username(user_id: int) -> str | None:
+    row = _conn.execute("SELECT username FROM profiles WHERE user_id = ?", (user_id,)).fetchone()
+    return row["username"] if row else None
+
+
+def find_user_by_username(username: str) -> int | None:
+    row = _conn.execute(
+        "SELECT user_id FROM profiles WHERE lower(username) = lower(?) ORDER BY rowid DESC LIMIT 1",
+        (username,),
+    ).fetchone()
+    return row["user_id"] if row else None
 
 
 def is_profile_complete(profile: dict) -> bool:
@@ -235,7 +256,7 @@ def confirm_payment(user_id: int) -> None:
 def get_confirmed_leads() -> list[dict]:
     """Список подтверждённых заявок, свежие сверху — для владельца, чтобы обзвонить клиентов."""
     rows = _conn.execute(
-        "SELECT user_id, name, phone, interest, confirmed_at FROM profiles "
+        "SELECT user_id, name, phone, interest, username, confirmed_at FROM profiles "
         "WHERE confirmed = 1 ORDER BY confirmed_at DESC"
     ).fetchall()
     return [dict(r) for r in rows]

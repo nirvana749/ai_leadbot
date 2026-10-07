@@ -56,6 +56,9 @@ from storage import (
     mark_declined,
     set_profile_fields,
     pause_ai,
+    set_username,
+    get_username,
+    find_user_by_username,
     get_stats,
     get_confirmed_leads,
 )
@@ -97,6 +100,7 @@ WEBHOOK_PORT = int(os.getenv("PORT") or os.getenv("WEBHOOK_PORT", "8000"))
 # подтверждение оплаты)
 MANYCHAT_API_KEY = os.getenv("MANYCHAT_API_KEY", "")
 MANYCHAT_API_URL = "https://api.manychat.com/fb/sending/sendContent"
+MANYCHAT_INFO_URL = "https://api.manychat.com/fb/subscriber/getInfo"
 # Сколько часов бот молчит после того, как владелец сам написал клиенту через бота
 # (каждое новое сообщение владельца продлевает паузу; кнопка «Вернуть ИИ» снимает её раньше)
 MANAGER_PAUSE_HOURS = float(os.getenv("MANAGER_PAUSE_HOURS", "12"))
@@ -257,6 +261,48 @@ def _channel_label(user_id: int) -> str:
     return "📷 Instagram" if _is_instagram(user_id) else "✈️ Telegram"
 
 
+def _client_ref(user_id: int) -> str:
+    """Клиент для менеджера: ник со ссылкой на профиль, чтобы можно было написать человеку напрямую."""
+    username = get_username(user_id)
+    if username:
+        link = f"instagram.com/{username}" if _is_instagram(user_id) else f"t.me/{username}"
+        return f"@{username} — {link}"
+    return f"ник неизвестен (id {user_id})"
+
+
+def _client_short(user_id: int) -> str:
+    username = get_username(user_id)
+    return f"@{username}" if username else f"id {user_id}"
+
+
+def _remember_tg_username(message: Message) -> None:
+    user = message.from_user
+    if user and user.username and user.username != get_username(user.id):
+        set_username(user.id, user.username)
+
+
+async def _fetch_ig_username(user_id: int) -> None:
+    """Ник Instagram-клиента берём из ManyChat API (один раз, дальше он лежит в базе)."""
+    if not MANYCHAT_API_KEY:
+        return
+    headers = {"Authorization": f"Bearer {MANYCHAT_API_KEY}"}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(
+                MANYCHAT_INFO_URL, params={"subscriber_id": abs(user_id)}, headers=headers
+            ) as resp:
+                data = await resp.json(content_type=None)
+    except Exception:
+        logging.exception("Не удалось получить ник Instagram-клиента %s из ManyChat", user_id)
+        return
+    info = (data or {}).get("data") or {}
+    username = info.get("ig_username") or info.get("username")
+    if username:
+        set_username(user_id, str(username).lstrip("@"))
+    else:
+        logging.warning("ManyChat не вернул ник для %s: %s", user_id, str(data)[:300])
+
+
 async def _manychat_send(subscriber_id: int, texts: list[str]) -> bool:
     """Отправка сообщений Instagram-клиенту через ManyChat API. True — если ушло."""
     if not MANYCHAT_API_KEY or not texts:
@@ -306,7 +352,8 @@ def format_profile(user_id: int, profile: dict, reason: str | None = None) -> st
     else:
         status = "🤔 Думает"
     text = (
-        f"📋 Заявка от клиента {user_id} ({_channel_label(user_id)})\n"
+        f"📋 Заявка ({_channel_label(user_id)})\n"
+        f"Клиент: {_client_ref(user_id)}\n"
         f"Имя: {profile.get('name') or '—'}\n"
         f"Телефон: {profile.get('phone') or '—'}\n"
         f"Услуга: {profile.get('interest') or '—'}\n"
@@ -326,24 +373,15 @@ def _is_manager(message: Message) -> bool:
 
 
 # ---------- Кнопки для менеджера ----------
-# Инлайн-кнопки едут прямо на карточке клиента — не нужно набирать /takeover <id>
-# руками. Постоянная кнопка "Статистика" снизу экрана — через reply-клавиатуру,
-# она не привязана к конкретному сообщению и остаётся видимой всегда.
+# Снизу экрана — только «Статистика». На карточках кнопок нет: бот сам возвращается
+# к клиенту после паузы (MANAGER_PAUSE_HOURS), а ответить клиенту можно через «Ответить».
+# Обработчики старых кнопок (takeover/release/history) оставлены ниже, чтобы
+# уже отправленные раньше карточки не сломались.
 
 MANAGER_MENU = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📋 Заявки")]],
+    keyboard=[[KeyboardButton(text="📊 Статистика")]],
     resize_keyboard=True,
 )
-
-
-def _card_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🙋 Взять чат", callback_data=f"takeover:{user_id}"),
-            InlineKeyboardButton(text="🔓 Вернуть ИИ", callback_data=f"release:{user_id}"),
-        ],
-        [InlineKeyboardButton(text="💬 История", callback_data=f"history:{user_id}")],
-    ])
 
 
 def _payment_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -357,7 +395,6 @@ async def notify_manager_profile(user_id: int, profile: dict, reason: str | None
         await bot.send_message(
             MANAGER_CHAT_ID,
             format_profile(user_id, profile, reason),
-            reply_markup=_card_keyboard(user_id),
         )
 
 
@@ -377,7 +414,7 @@ def _leads_text() -> str:
     if not leads:
         return "Подтверждённых заявок пока нет."
     lines = [
-        f"• {l['name']} — {l['phone']} — {l['interest']} (id {l['user_id']})"
+        f"• {l['name']} — {l['phone']} — {l['interest']} ({_client_short(l['user_id'])})"
         for l in leads
     ]
     return "📋 Подтверждённые заявки (свежие сверху):\n\n" + "\n".join(lines)
@@ -386,13 +423,13 @@ def _leads_text() -> str:
 async def _send_history(chat_id, user_id: int) -> None:
     history = get_full_history(user_id)
     if not history:
-        await bot.send_message(chat_id, f"Переписки с {user_id} не найдено.")
+        await bot.send_message(chat_id, f"Переписки с {_client_short(user_id)} не найдено.")
         return
 
     speakers = {"user": "Клиент", "assistant": "Бот", "manager": "Вы"}
     lines = [f"[{m['ts']}] {speakers.get(m['role'], m['role'])}: {m['content']}" for m in history]
 
-    header = f"💬 Переписка с {user_id}\n\n"
+    header = f"💬 Переписка с {_client_short(user_id)}\n\n"
     chunk = header
     for line in lines:
         if len(chunk) + len(line) + 1 > 3500:
@@ -407,24 +444,24 @@ async def _takeover(user_id: int) -> None:
     set_mode(user_id, "manager")
     _cancel_followup(user_id)
     handoff_note = (
-        "Это клиент из Instagram — отвечай ему напрямую в Live Chat в ManyChat."
+        "Это клиент из Instagram — ответь ему в ManyChat Inbox или через «Ответить» здесь."
         if _is_instagram(user_id) else
         "Чтобы написать клиенту, ответь (Reply) на его сообщение или карточку здесь — бот перешлёт."
     )
-    await bot.send_message(MANAGER_CHAT_ID, f"Бот замолчал для {user_id}. {handoff_note}")
+    await bot.send_message(MANAGER_CHAT_ID, f"Бот замолчал для {_client_short(user_id)}. {handoff_note}")
     await bot.send_message(MANAGER_CHAT_ID, format_profile(user_id, get_profile(user_id)))
     await _send_to_client(user_id, "Секунду, вас подключает наш специалист 🙌")
 
 
 async def _release(user_id: int) -> None:
     set_mode(user_id, "ai")
-    await bot.send_message(MANAGER_CHAT_ID, f"ИИ снова отвечает {user_id}.")
+    await bot.send_message(MANAGER_CHAT_ID, f"ИИ снова отвечает {_client_short(user_id)}.")
 
 
 async def _confirm_payment(user_id: int) -> None:
     confirm_payment(user_id)
     _cancel_followup(user_id)
-    await bot.send_message(MANAGER_CHAT_ID, f"Оплата {user_id} подтверждена.")
+    await bot.send_message(MANAGER_CHAT_ID, f"Оплата {_client_short(user_id)} подтверждена.")
     await _send_to_client(user_id, "Оплата подтверждена, спасибо! 🎉 Дальше расскажу, что происходит.")
 
 
@@ -558,11 +595,19 @@ async def cb_confirm_payment(callback: CallbackQuery):
 CLIENT_ID_PATTERN = re.compile(r"(?<![\d+])(-?\d{5,})")
 
 
+USERNAME_PATTERN = re.compile(r"@([A-Za-z0-9_.]{3,})")
+
+
 def _client_id_from_reply(message: Message) -> int | None:
     replied = message.reply_to_message
     if not replied:
         return None
-    match = CLIENT_ID_PATTERN.search(replied.text or replied.caption or "")
+    text = replied.text or replied.caption or ""
+    for username in USERNAME_PATTERN.findall(text):
+        user_id = find_user_by_username(username.rstrip("."))
+        if user_id is not None:
+            return user_id
+    match = CLIENT_ID_PATTERN.search(text)
     return int(match.group(1)) if match else None
 
 
@@ -592,15 +637,15 @@ async def manager_reply_to_client(message: Message):
 
     hours = f"{MANAGER_PAUSE_HOURS:g}"
     if sent:
-        status = f"✅ Отправлено клиенту {user_id}. Бот молчит в этом диалоге {hours} ч."
+        status = f"✅ Отправлено {_client_short(user_id)}. Бот молчит в этом диалоге {hours} ч."
     elif _is_instagram(user_id):
         status = (
-            f"⚠️ Клиенту {user_id} не отправилось (нужен MANYCHAT_API_KEY, текст, и клиент должен был "
+            f"⚠️ {_client_short(user_id)}: не отправилось (нужен MANYCHAT_API_KEY, текст, и клиент должен был "
             f"писать за последние 24 ч) — ответьте в ManyChat Inbox. Бот всё равно молчит {hours} ч."
         )
     else:
-        status = f"⚠️ Клиенту {user_id} не отправилось (возможно, он заблокировал бота). Бот молчит {hours} ч."
-    await message.answer(status, reply_markup=_card_keyboard(user_id))
+        status = f"⚠️ {_client_short(user_id)}: не отправилось (возможно, он заблокировал бота). Бот молчит {hours} ч."
+    await message.answer(status)
 
 
 # ---------- Клиентские сообщения ----------
@@ -610,8 +655,8 @@ async def cmd_start(message: Message):
     if _is_manager(message):
         await message.answer(
             "Привет! Это панель управления ботом.\n\n"
-            "Кнопка «📊 Статистика» всегда снизу. На карточке клиента — кнопки «Взять чат», "
-            "«Вернуть ИИ» и «История» (не нужно набирать команды вручную).",
+            "Кнопка «📊 Статистика» всегда снизу. Когда клиент просит живого человека — "
+            "придёт уведомление; чтобы ответить ему, нажмите «Ответить» на это уведомление.",
             reply_markup=MANAGER_MENU,
         )
         return
@@ -636,6 +681,7 @@ async def request_payment(message: Message):
 @dp.message(F.photo)
 async def receive_payment_screenshot(message: Message):
     user_id = message.from_user.id
+    _remember_tg_username(message)
     try:
         if is_payment_pending(user_id):
             await message.answer("Скриншот получен, жду подтверждения от менеджера 🙏")
@@ -643,7 +689,7 @@ async def receive_payment_screenshot(message: Message):
                 await bot.forward_message(MANAGER_CHAT_ID, message.chat.id, message.message_id)
                 await bot.send_message(
                     MANAGER_CHAT_ID,
-                    f"Чек от {user_id}.",
+                    f"Чек от {_client_short(user_id)}.",
                     reply_markup=_payment_keyboard(user_id),
                 )
         else:
@@ -702,12 +748,30 @@ def _missing_fields_text(profile: dict) -> str:
 
 
 async def _handover_to_manager(user_id: int, reason: str) -> list[str]:
-    set_mode(user_id, "manager")
+    # Пауза, а не бессрочный ручной режим: если менеджер не ответит, бот сам вернётся
+    # к клиенту через MANAGER_PAUSE_HOURS и чат не застрянет «у человека» навсегда
+    pause_ai(user_id, MANAGER_PAUSE_HOURS)
     _cancel_followup(user_id)
     if MANAGER_CHAT_ID:
-        await bot.send_message(MANAGER_CHAT_ID, f"🙋 Клиенту {_channel_label(user_id)} {user_id} нужен менеджер.")
-        await notify_manager_profile(user_id, get_profile(user_id), reason=reason)
+        where = "здесь через «Ответить» или в ManyChat Inbox" if _is_instagram(user_id) else "здесь через «Ответить»"
+        await bot.send_message(
+            MANAGER_CHAT_ID,
+            "🙋 Просят живого человека\n\n"
+            + format_profile(user_id, get_profile(user_id), reason)
+            + f"\n\nБот молчит в этом диалоге {MANAGER_PAUSE_HOURS:g} ч, потом снова ответит сам. "
+            f"Написать клиенту: {where}.",
+        )
     return [HANDOVER_TEXT]
+
+
+def _since_last_handover(history: list[dict]) -> list[dict]:
+    """Переписка после последней передачи человеку. Без этого после возврата к ИИ разбор снова
+    видел старую просьбу позвать менеджера (или старое недовольство) и тут же опять
+    передавал чат человеку — диалог застревал «у менеджера» намертво."""
+    for i in range(len(history) - 1, -1, -1):
+        if history[i]["role"] == "assistant" and history[i]["content"] == HANDOVER_TEXT:
+            return history[i + 1:]
+    return history
 
 
 async def _confirm_lead(user_id: int) -> list[str]:
@@ -747,7 +811,7 @@ async def _process_message(user_id: int, text: str, *, channel: str) -> list[str
     if mode == "manager":
         # В ручном режиме бот молчит, но пересылает менеджеру, если тот не в диалоге
         if MANAGER_CHAT_ID:
-            await bot.send_message(MANAGER_CHAT_ID, f"[{_channel_label(user_id)} {user_id}] {text}")
+            await bot.send_message(MANAGER_CHAT_ID, f"[{_channel_label(user_id)} {_client_short(user_id)}] {text}")
         # Телефон продолжаем ловить и в ручном режиме, чтобы данные не терялись
         # (карточку менеджеру не шлём повторно — он уже в диалоге с клиентом)
         phone, _ = find_phone(text)
@@ -812,7 +876,9 @@ async def _reply_to_client(user_id: int, text: str, *, channel: str) -> list[str
             return None
 
     try:
-        analysis = await analyze_message(history, profile, awaiting_confirmation=awaiting_confirmation)
+        analysis = await analyze_message(
+            _since_last_handover(history), profile, awaiting_confirmation=awaiting_confirmation
+        )
     except Exception:
         # Разбор не удался — просто отвечаем как обычно, ничего не теряя из данных клиента
         logging.exception("Не удалось разобрать сообщение %s (%s)", user_id, channel)
@@ -906,6 +972,7 @@ async def _reply_to_client(user_id: int, text: str, *, channel: str) -> list[str
 @dp.message(F.text)
 async def handle_text(message: Message):
     user_id = message.from_user.id
+    _remember_tg_username(message)
     try:
         async with _get_user_lock(user_id):
             replies = await _process_message(user_id, message.text, channel="telegram")
@@ -956,6 +1023,10 @@ async def manychat_webhook(request: web.Request) -> web.Response:
     except (TypeError, ValueError):
         return web.json_response({"error": "subscriber_id must be numeric"}, status=400)
 
+    username = str(data.get("ig_username") or data.get("username") or "").strip().lstrip("@")
+    if username and username != get_username(user_id):
+        set_username(user_id, username)
+
     if MANYCHAT_API_KEY:
         # Быстрый режим: сразу отвечаем ManyChat «принято», а ответ ИИ отправляем
         # следом через ManyChat API — так не упираемся в таймаут External Request
@@ -976,6 +1047,8 @@ async def manychat_webhook(request: web.Request) -> web.Response:
 
 
 async def _process_instagram_async(user_id: int, subscriber_id, text: str) -> None:
+    if not get_username(user_id):
+        await _fetch_ig_username(user_id)
     try:
         async with _get_user_lock(user_id):
             replies = await _process_message(user_id, text, channel="instagram")
@@ -1001,13 +1074,10 @@ async def handle_other(message: Message):
     )
 
 
+# В меню — только статистика. Остальные команды (/leads, /history, /takeover, /release,
+# /confirm_payment) по-прежнему работают, если набрать их вручную
 MANAGER_COMMANDS = [
     BotCommand(command="stats", description="Статистика заявок"),
-    BotCommand(command="leads", description="Подтверждённые заявки с контактами"),
-    BotCommand(command="history", description="Переписка с клиентом: /history <id>"),
-    BotCommand(command="takeover", description="Забрать диалог себе: /takeover <id>"),
-    BotCommand(command="release", description="Вернуть диалог ИИ: /release <id>"),
-    BotCommand(command="confirm_payment", description="Подтвердить оплату: /confirm_payment <id>"),
 ]
 
 
