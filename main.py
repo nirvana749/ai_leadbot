@@ -343,9 +343,8 @@ async def _alert_delivery_failed(user_id: int, details: str) -> None:
         return
     _last_delivery_alert[user_id] = now
     try:
-        await bot.send_message(
-            MANAGER_CHAT_ID,
-            f"⚠️ Ответ бота не доставлен в Instagram — {_client_ref(user_id)}\n\nОшибка ManyChat:\n{details}",
+        await _send_manager(
+            f"⚠️ Ответ бота не доставлен в Instagram — {_client_ref(user_id)}\n\nОшибка ManyChat:\n{details}"
         )
     except Exception:
         logging.exception("Не удалось отправить менеджеру уведомление об ошибке доставки")
@@ -404,15 +403,19 @@ def _is_manager(message: Message) -> bool:
 MANAGER_MENU = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="💬 Чаты"), KeyboardButton(text="📊 Статистика")]],
     resize_keyboard=True,
+    is_persistent=True,  # кнопки всегда видны менеджеру, даже если он свернул клавиатуру
 )
+
+
+async def _send_manager(text: str) -> None:
+    """Сообщение в чат менеджера. Клавиатуру прикладываем к каждому уведомлению, чтобы кнопки
+    панели не пропадали (например, после очистки чата или входа с другого устройства)."""
+    await bot.send_message(MANAGER_CHAT_ID, text, reply_markup=MANAGER_MENU)
 
 
 async def notify_manager_profile(user_id: int, profile: dict, reason: str | None = None) -> None:
     if MANAGER_CHAT_ID:
-        await bot.send_message(
-            MANAGER_CHAT_ID,
-            format_profile(user_id, profile, reason),
-        )
+        await _send_manager(format_profile(user_id, profile, reason))
 
 
 def _stats_text() -> str:
@@ -465,14 +468,14 @@ async def _takeover(user_id: int) -> None:
         if _is_instagram(user_id) else
         "Чтобы написать клиенту, ответь (Reply) на его сообщение или карточку здесь — бот перешлёт."
     )
-    await bot.send_message(MANAGER_CHAT_ID, f"Бот замолчал для {_client_short(user_id)}. {handoff_note}")
-    await bot.send_message(MANAGER_CHAT_ID, format_profile(user_id, get_profile(user_id)))
-    await _send_to_client(user_id, "Секунду, вас подключает наш специалист 🙌")
+    await _send_manager(f"Бот замолчал для {_client_short(user_id)}. {handoff_note}")
+    await _send_manager(format_profile(user_id, get_profile(user_id)))
+    await _send_to_client(user_id, "Одну минуту, к диалогу подключается наш специалист.")
 
 
 async def _release(user_id: int) -> None:
     set_mode(user_id, "ai")
-    await bot.send_message(MANAGER_CHAT_ID, f"ИИ снова отвечает {_client_short(user_id)}.")
+    await _send_manager(f"ИИ снова отвечает {_client_short(user_id)}.")
 
 
 # ---------- Команды менеджера (на случай, если удобнее текстом) ----------
@@ -784,8 +787,8 @@ async def cmd_start(message: Message):
         return
     set_mode(message.from_user.id, "ai")
     await message.answer(
-        f"Здравствуйте! Я {CONSULTANT_NAME}, консультант {DEALER_NAME} 🙂 "
-        "Вижу, вас заинтересовал Porsche Macan — какую версию присматриваете?"
+        f"Здравствуйте! Меня зовут {CONSULTANT_NAME}, я консультант {DEALER_NAME}. "
+        "Вижу, вас заинтересовал Porsche Macan — подскажите, какую версию вы рассматриваете?"
     )
 
 
@@ -814,7 +817,9 @@ CONFIRM_PROMPT_TEMPLATE = (
 
 CONFIRM_REMINDER = "И гляньте, пожалуйста, данные для заявки выше: если всё верно — напишите «да», если нет — просто поправьте."
 
-HANDOVER_TEXT = "Подключаю живого специалиста, минутку 🙌"
+HANDOVER_TEXT = "Одну минуту, подключаю к диалогу персонального менеджера."
+# Прежние варианты — чтобы в старых переписках по-прежнему находилась последняя передача человеку
+_OLD_HANDOVER_TEXTS = ("Подключаю живого специалиста, минутку 🙌",)
 
 TECH_ISSUE_TEXT = "Секунду, у меня техническая заминка — уже разбираюсь. Если срочно, напишите «менеджер» 🙏"
 
@@ -833,8 +838,8 @@ def _missing_fields_text(profile: dict) -> str:
     if not profile.get("phone"):
         missing.append("номер телефона")
     return (
-        f"Супер, давайте запишу вас 🙌 Подскажите, пожалуйста, {' и '.join(missing)} — "
-        "менеджер наберёт и подберёт удобное время."
+        f"С удовольствием запишу вас. Подскажите, пожалуйста, {' и '.join(missing)} — "
+        "менеджер свяжется с вами и подберёт удобное время."
     )
 
 
@@ -845,12 +850,11 @@ async def _handover_to_manager(user_id: int, reason: str) -> list[str]:
     _cancel_followup(user_id)
     if MANAGER_CHAT_ID:
         where = "здесь через «Ответить» или в ManyChat Inbox" if _is_instagram(user_id) else "здесь через «Ответить»"
-        await bot.send_message(
-            MANAGER_CHAT_ID,
+        await _send_manager(
             "🙋 Просят живого человека\n\n"
             + format_profile(user_id, get_profile(user_id), reason)
             + f"\n\nБот молчит в этом диалоге {MANAGER_PAUSE_HOURS:g} ч, потом снова ответит сам. "
-            f"Написать клиенту: {where}.",
+            f"Написать клиенту: {where}."
         )
     return [HANDOVER_TEXT]
 
@@ -860,7 +864,7 @@ def _since_last_handover(history: list[dict]) -> list[dict]:
     видел старую просьбу позвать менеджера (или старое недовольство) и тут же опять
     передавал чат человеку — диалог застревал «у менеджера» намертво."""
     for i in range(len(history) - 1, -1, -1):
-        if history[i]["role"] == "assistant" and history[i]["content"] == HANDOVER_TEXT:
+        if history[i]["role"] == "assistant" and history[i]["content"] in (HANDOVER_TEXT, *_OLD_HANDOVER_TEXTS):
             return history[i + 1:]
     return history
 
@@ -869,7 +873,7 @@ async def _confirm_lead(user_id: int) -> list[str]:
     mark_confirmed(user_id)
     _cancel_followup(user_id)
     await notify_manager_profile(user_id, get_profile(user_id))
-    return ["Отлично, записал! Менеджер наберёт вас в ближайшее время и согласует время тест-драйва 🙌"]
+    return ["Благодарю, записал. Менеджер свяжется с вами в ближайшее время и согласует удобное время."]
 
 
 def _apply_corrections(user_id: int, phone: str | None, looked_like_phone: bool, corrections: dict) -> list[str]:
@@ -905,7 +909,7 @@ async def _process_message(user_id: int, text: str, *, channel: str) -> list[str
         # и чтобы ИИ после включения знал, о чём шла речь
         add_message(user_id, "user", text)
         if MANAGER_CHAT_ID:
-            await bot.send_message(MANAGER_CHAT_ID, f"[{_channel_label(user_id)} {_client_short(user_id)}] {text}")
+            await _send_manager(f"[{_channel_label(user_id)} {_client_short(user_id)}] {text}")
         # Телефон продолжаем ловить и в ручном режиме, чтобы данные не терялись
         # (карточку менеджеру не шлём повторно — он уже в диалоге с клиентом)
         phone, _ = find_phone(text)
@@ -1026,7 +1030,7 @@ async def _reply_to_client(user_id: int, text: str, *, channel: str) -> list[str
         card = _confirm_card(profile)
         if ready and not analysis["asks_question"]:
             reply_task.cancel()
-            return ["Отлично, записываю 🙌\n\n" + card]
+            return ["Прекрасно, записываю вас.\n\n" + card]
         reply = await get_reply()
         return ([reply] if reply else []) + [card]
 
@@ -1163,8 +1167,8 @@ async def handle_other(message: Message):
             await bot.forward_message(MANAGER_CHAT_ID, message.chat.id, message.message_id)
         return
     await message.answer(
-        "Пока понимаю только текстовые сообщения — "
-        "напишите, пожалуйста, словами 🙂"
+        "К сожалению, пока я читаю только текстовые сообщения — "
+        "напишите, пожалуйста, ваш вопрос текстом."
     )
 
 
