@@ -77,24 +77,25 @@ def check(title: str, ok: bool) -> None:
 async def run() -> None:
     print("=" * 70 + "\n1) Клиент сразу готов заказать (Instagram, id < 0)\n" + "=" * 70)
     u = -1001
-    r = await say(u, "Здравствуйте, хочу заказать пакет. Меня зовут Айгерим, 87011234567")
+    r = await say(u, "Здравствуйте, хочу записаться на тест-драйв Macan. Меня зовут Айгерим, 87011234567")
     p = get_profile(u)
     check("сразу карточка на подтверждение", p["confirm_asked"] and any("всё верно" in x for x in r))
-    check("нет вопроса про бизнес", not any("бизнес" in x.lower() for x in r))
-    check("услуга по умолчанию — пакет", p["interest"] == main.DEFAULT_INTEREST)
+    check("не продаёт дальше, сразу к записи", not any("какую версию" in x.lower() for x in r))
+    check("интерес про Macan", "macan" in (p["interest"] or "").lower())
+    interest = p["interest"]
 
     print("\n" + "=" * 70 + "\n2) Исправление телефона в карточке\n" + "=" * 70)
     await say(u, "не верно, телефон 87779998877")
     p = get_profile(u)
     check("телефон обновился", p["phone"] == "+77779998877")
-    check("имя и услуга не стёрлись", p["name"] == "Айгерим" and p["interest"] == main.DEFAULT_INTEREST)
+    check("имя и услуга не стёрлись", p["name"] == "Айгерим" and p["interest"] == interest)
     check("заявка ещё не подтверждена", not p["confirmed"])
     await say(u, "да")
     check("после «да» заявка подтверждена", get_profile(u)["confirmed"])
 
     print("\n" + "=" * 70 + "\n3) «а когда начнём?» на карточку — не подтверждение\n" + "=" * 70)
     u = 1002
-    await say(u, "Здравствуйте, хочу заказать пакет. Меня зовут Айгерим, 87011234567")
+    await say(u, "Здравствуйте, хочу записаться на тест-драйв Macan. Меня зовут Айгерим, 87011234567")
     await say(u, "а когда начнём?")
     p = get_profile(u)
     check("не подтверждено", not p["confirmed"])
@@ -112,9 +113,9 @@ async def run() -> None:
 
     print("\n" + "=" * 70 + "\n6) Доп.: «хочу заказать» без данных — просит только имя и телефон\n" + "=" * 70)
     u = 1005
-    r = await say(u, "Хочу заказать у вас рекламу, как оформить?")
-    check("просит имя и телефон, без вопросов про бизнес",
-          get_mode(u) == "ai" and any("телефон" in x for x in r) and not any("бизнес" in x.lower() for x in r))
+    r = await say(u, "Хочу на тест-драйв Macan 4S, как записаться?")
+    check("просит имя и телефон, без лишних вопросов",
+          get_mode(u) == "ai" and any("телефон" in x for x in r) and not any("какую версию" in x.lower() for x in r))
 
     print("\n" + "=" * 70 + "\n7) Доп.: проверка целыми словами (без ИИ)\n" + "=" * 70)
     check("«когда» — не «да»", not main._is_exact("а когда начнём?", main.YES_EXACT))

@@ -39,7 +39,7 @@ from aiogram.types import (
     BotCommandScopeChat,
 )
 
-from ai import ask_ai, ask_followup, analyze_message
+from ai import ask_ai, ask_followup, analyze_message, CONSULTANT_NAME, DEALER_NAME, DEFAULT_INTEREST
 from storage import (
     get_mode,
     set_mode,
@@ -78,8 +78,6 @@ MANAGER_EXACT = {
     "менеджер", "оператор", "человек", "живой человек", "позовите менеджера", "позови менеджера",
     "нужен менеджер", "хочу менеджера", "менеджера", "менеджера пожалуйста",
 }
-
-DEFAULT_INTEREST = "Пакет «Скорая Помощь для бизнеса» под ключ"
 
 DECLINE_WORDS = (
     "не хочу", "не интересно", "неинтересно", "не нужно", "не надо",
@@ -381,7 +379,7 @@ def format_profile(user_id: int, profile: dict, reason: str | None = None) -> st
         f"Клиент: {_client_ref(user_id)}\n"
         f"Имя: {profile.get('name') or '—'}\n"
         f"Телефон: {profile.get('phone') or '—'}\n"
-        f"Услуга: {profile.get('interest') or '—'}\n"
+        f"Интерес: {profile.get('interest') or '—'}\n"
         f"Статус: {status}"
     )
     if reason:
@@ -786,9 +784,8 @@ async def cmd_start(message: Message):
         return
     set_mode(message.from_user.id, "ai")
     await message.answer(
-        "Привет! Я Эдуард, digital-маркетолог, а это мой личный ИИ-ассистент — "
-        "он на связи 24/7 и ответит на любые вопросы. Если понадобится живой человек — просто напиши об этом.\n\n"
-        "Чем я могу вам помочь?"
+        f"Здравствуйте! Я {CONSULTANT_NAME}, консультант {DEALER_NAME} 🙂 "
+        "Вижу, вас заинтересовал Porsche Macan — какую версию присматриваете?"
     )
 
 
@@ -808,10 +805,10 @@ async def _reply_with_fallback(message: Message, user_id: int) -> None:
 
 
 CONFIRM_PROMPT_TEMPLATE = (
-    "Проверьте, пожалуйста, я всё верно записал?\n\n"
+    "Проверьте, пожалуйста, всё верно записал?\n\n"
     "Имя: {name}\n"
     "Телефон: {phone}\n"
-    "Услуга: {interest}\n\n"
+    "Интерес: {interest}\n\n"
     "Если всё верно — напишите «да»."
 )
 
@@ -836,8 +833,8 @@ def _missing_fields_text(profile: dict) -> str:
     if not profile.get("phone"):
         missing.append("номер телефона")
     return (
-        f"Отлично, оформим заявку на «{profile.get('interest') or DEFAULT_INTEREST}» 🙌 "
-        f"Напишите, пожалуйста, {' и '.join(missing)}."
+        f"Супер, давайте запишу вас 🙌 Подскажите, пожалуйста, {' и '.join(missing)} — "
+        "менеджер наберёт и подберёт удобное время."
     )
 
 
@@ -872,7 +869,7 @@ async def _confirm_lead(user_id: int) -> list[str]:
     mark_confirmed(user_id)
     _cancel_followup(user_id)
     await notify_manager_profile(user_id, get_profile(user_id))
-    return ["Отлично, спасибо! Передал заявку менеджеру, он свяжется с вами в ближайшее время 🙌"]
+    return ["Отлично, записал! Менеджер наберёт вас в ближайшее время и согласует время тест-драйва 🙌"]
 
 
 def _apply_corrections(user_id: int, phone: str | None, looked_like_phone: bool, corrections: dict) -> list[str]:
@@ -1019,7 +1016,7 @@ async def _reply_to_client(user_id: int, text: str, *, channel: str) -> list[str
     if not profile.get("confirmed") and not profile.get("interest") and (
         ready or (profile.get("name") and profile.get("phone"))
     ):
-        # Клиент готов заказать (или уже оставил контакты), но услугу не назвал — значит, пакет
+        # Клиент готов к тест-драйву (или уже оставил контакты), но версию не назвал — пишем общий интерес
         update_profile(user_id, {"interest": DEFAULT_INTEREST})
         profile = get_profile(user_id)
 
@@ -1029,7 +1026,7 @@ async def _reply_to_client(user_id: int, text: str, *, channel: str) -> list[str
         card = _confirm_card(profile)
         if ready and not analysis["asks_question"]:
             reply_task.cancel()
-            return ["Отлично, оформляю заявку 🙌\n\n" + card]
+            return ["Отлично, записываю 🙌\n\n" + card]
         reply = await get_reply()
         return ([reply] if reply else []) + [card]
 
@@ -1192,13 +1189,12 @@ async def main():
             logging.exception("Не удалось выставить меню команд для менеджера")
     try:
         await bot.set_my_short_description(
-            short_description="Маркетолог Эдуард. Личный ИИ-ассистент 24/7: консультирует "
-            "и оформляет заявки на пакет «Скорая Помощь для бизнеса»."
+            short_description=f"{DEALER_NAME}: консультант по Porsche Macan 24/7. "
+            "Подбор версии, расчёт и запись на тест-драйв."
         )
         await bot.set_my_description(
-            description="Здесь отвечает мой личный ИИ-ассистент — он на связи круглосуточно, "
-            "расскажет про пакет «Скорая Помощь для бизнеса» под ключ (рекламные ролики + таргет + чат-бот) "
-            "и оформит заявку. "
+            description=f"Онлайн-консультант {DEALER_NAME} на связи круглосуточно: расскажет про Porsche Macan, "
+            "поможет выбрать версию, посчитает предложение и запишет на тест-драйв. "
             "В любой момент можно написать «менеджер», чтобы подключился живой человек."
         )
     except Exception:
