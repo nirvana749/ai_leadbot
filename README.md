@@ -16,7 +16,6 @@
 | `MANYCHAT_WEBHOOK_TOKEN` | придуманная строка без пробелов |
 | `MANYCHAT_API_KEY` | ManyChat → Settings → API → Generate |
 | `DB_PATH` | `/data/bot.db` |
-| `CONSULTANT_NAME` | имя продавца-консультанта (по умолчанию `Тимур`) |
 | `DEALER_NAME` | название салона (по умолчанию `Porsche Центр Алматы`; контакты салона — `DEALER_CONTACTS` в `ai.py`) |
 
 Потом: **Settings → Networking → Generate Domain**, и **Volume** с Mount path `/data`.

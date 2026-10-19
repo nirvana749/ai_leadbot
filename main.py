@@ -39,7 +39,7 @@ from aiogram.types import (
     BotCommandScopeChat,
 )
 
-from ai import ask_ai, ask_followup, analyze_message, CONSULTANT_NAME, DEALER_NAME, DEFAULT_INTEREST
+from ai import ask_ai, ask_followup, analyze_message, DEALER_NAME, DEFAULT_INTEREST
 from storage import (
     get_mode,
     set_mode,
@@ -787,8 +787,8 @@ async def cmd_start(message: Message):
         return
     set_mode(message.from_user.id, "ai")
     await message.answer(
-        f"Здравствуйте! Меня зовут {CONSULTANT_NAME}, я консультант {DEALER_NAME}. "
-        "Вижу, вас заинтересовал Porsche Macan — подскажите, какую версию вы рассматриваете?"
+        f"Здравствуйте! Вас приветствует {DEALER_NAME}. "
+        "Подскажите, какая версия Porsche Macan вас интересует?"
     )
 
 
